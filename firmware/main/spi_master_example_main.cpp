@@ -38,9 +38,18 @@
 #define PIN_NUM_RST  18
 #define PIN_NUM_BCKL 5
 
+
+#define LED_PIN_MOSI 13
+#define LED_PIN_CLK  14
+#define LED_PIN_NONE -1
 //To speed up transfers, every SPI transfer sends a bunch of lines. This define specifies how many. More means more memory use,
 //but less overhead for setting up / finishing transfers. Make sure 240 is dividable by this.
 #define PARALLEL_LINES 16
+
+extern "C" {
+	void app_main();
+
+}
 
 /*
  The LCD needs a bunch of command/argument values to be initialized. They are stored in this struct.
@@ -184,7 +193,7 @@ void lcd_data(spi_device_handle_t spi, const uint8_t *data, int len)
 void lcd_spi_pre_transfer_callback(spi_transaction_t *t)
 {
     int dc=(int)t->user;
-    gpio_set_level(PIN_NUM_DC, dc);
+    gpio_set_level((gpio_num_t)PIN_NUM_DC, dc);
 }
 
 uint32_t lcd_get_id(spi_device_handle_t spi)
@@ -211,14 +220,14 @@ void lcd_init(spi_device_handle_t spi)
     const lcd_init_cmd_t* lcd_init_cmds;
 
     //Initialize non-SPI GPIOs
-    gpio_set_direction(PIN_NUM_DC, GPIO_MODE_OUTPUT);
-    gpio_set_direction(PIN_NUM_RST, GPIO_MODE_OUTPUT);
-    gpio_set_direction(PIN_NUM_BCKL, GPIO_MODE_OUTPUT);
+    gpio_set_direction((gpio_num_t)PIN_NUM_DC, GPIO_MODE_OUTPUT);
+    gpio_set_direction((gpio_num_t)PIN_NUM_RST, GPIO_MODE_OUTPUT);
+    gpio_set_direction((gpio_num_t)PIN_NUM_BCKL, GPIO_MODE_OUTPUT);
 
     //Reset the display
-    gpio_set_level(PIN_NUM_RST, 0);
+    gpio_set_level((gpio_num_t)PIN_NUM_RST, 0);
     vTaskDelay(100 / portTICK_RATE_MS);
-    gpio_set_level(PIN_NUM_RST, 1);
+    gpio_set_level((gpio_num_t)PIN_NUM_RST, 1);
     vTaskDelay(100 / portTICK_RATE_MS);
 
     //detect LCD type
@@ -265,7 +274,7 @@ void lcd_init(spi_device_handle_t spi)
     }
 
     ///Enable backlight
-    gpio_set_level(PIN_NUM_BCKL, 0);
+    gpio_set_level((gpio_num_t)PIN_NUM_BCKL, 0);
 }
 
 
@@ -345,7 +354,7 @@ static void display_pretty_colors(spi_device_handle_t spi)
     uint16_t *lines[2];
     //Allocate memory for the pixel buffers
     for (int i=0; i<2; i++) {
-        lines[i]=heap_caps_malloc(320*PARALLEL_LINES*sizeof(uint16_t), MALLOC_CAP_DMA);
+        lines[i]=(uint16_t*)heap_caps_malloc(320*PARALLEL_LINES*sizeof(uint16_t), MALLOC_CAP_DMA);
         assert(lines[i]!=NULL);
     }
     int frame=0;
@@ -372,37 +381,121 @@ static void display_pretty_colors(spi_device_handle_t spi)
     }
 }
 
-void app_main()
-{
-    esp_err_t ret;
-    spi_device_handle_t spi;
-    spi_bus_config_t buscfg={
-        .miso_io_num=PIN_NUM_MISO,
-        .mosi_io_num=PIN_NUM_MOSI,
-        .sclk_io_num=PIN_NUM_CLK,
-        .quadwp_io_num=-1,
-        .quadhd_io_num=-1,
-        .max_transfer_sz=PARALLEL_LINES*320*2+8
-    };
-    spi_device_interface_config_t devcfg={
+
+//////////////////////////////////////////////
+// LEDS
+class Wiring {
+public:
+	Wiring(){}
+	bool init() {
+		return onInit();
+	}
+	virtual uint8_t send(uint8_t b)=0;
+	virtual uint8_t receive(uint8_t b)=0;
+protected:
+	virtual bool onInit()=0;
+};
+
+class ESP32SPIWiring : public Wiring {
+public:
+	static ESP32SPIWiring create(spi_host_device_t shd, int miso, int mosi, int clk, int cs, int tb) {
+		ESP32SPIWiring esp32(shd,miso,mosi,clk,cs, tb);
+		return esp32;
+	}
+public:
+	virtual uint8_t send(uint8_t b) {
+		return 0;
+	}
+	virtual uint8_t receive(uint8_t b) {
+		return 0;
+	}
+protected:
+	ESP32SPIWiring(spi_host_device_t spihd, int miso, int mosi, int clk, int cs, int bufSize) 
+		: SpiHD(spihd), PinMiso(miso), PinMosi(mosi), PinCLK(clk), PinCS(cs), TransferBufferSize(bufSize) { }
+	virtual bool onInit() {
+		esp_err_t ret;
+
+		spi_bus_config_t buscfg;
+		buscfg.miso_io_num=PinMiso;
+		buscfg.mosi_io_num=PinMosi;
+		buscfg.sclk_io_num=PinCLK;
+		buscfg.quadwp_io_num=-1;
+		buscfg.quadhd_io_num=-1;
+		buscfg.max_transfer_sz=TransferBufferSize;
+		buscfg.flags = SPICOMMON_BUSFLAG_MASTER;
+		buscfg.intr_flags = 0;
+
+		//Initialize the SPI bus
+		ret=spi_bus_initialize(SpiHD, &buscfg, 1);
+		ESP_ERROR_CHECK(ret);
+
+		spi_device_interface_config_t devcfg;
+		devcfg.clock_speed_hz=1*1000*1000;         //Clock out at 1 MHz
+		devcfg.mode=0;                             //SPI mode 0
+		devcfg.spics_io_num=PinCS;               	//CS pin
+		devcfg.queue_size=3;                       //We want to be able to queue 3 transactions at a time
+		devcfg.duty_cycle_pos = 0;
+		devcfg.cs_ena_pretrans = 0;
+		devcfg.cs_ena_posttrans = 0; 
+		devcfg.input_delay_ns = 0;
+		devcfg.flags = 0;
+		devcfg.pre_cb = nullptr;
+		devcfg.post_cb = nullptr;
+
+		//Attach the LED to the SPI bus
+		ret=spi_bus_add_device(SpiHD, &devcfg, &spi);
+		ESP_ERROR_CHECK(ret);
+	 	return ESP_OK==ret;
+	}
+private:
+	spi_host_device_t SpiHD;
+	int PinMiso;
+	int PinMosi;
+	int PinCLK;
+	int PinCS;
+	int TransferBufferSize;
+	spi_device_handle_t spi;
+};
+
+void app_main() {
+	esp_err_t ret;
+	spi_device_handle_t spi;
+	spi_bus_config_t buscfg;
+	memset(&buscfg,0,sizeof(buscfg));
+	buscfg.miso_io_num=PIN_NUM_MISO;
+        buscfg.mosi_io_num=PIN_NUM_MOSI;
+        buscfg.sclk_io_num=PIN_NUM_CLK;
+        buscfg.quadwp_io_num=-1;
+        buscfg.quadhd_io_num=-1;
+	buscfg.max_transfer_sz=PARALLEL_LINES*320*2+8;
+
+    	spi_device_interface_config_t devcfg;
+	memset(&devcfg,0,sizeof(devcfg));
 #ifdef CONFIG_LCD_OVERCLOCK
         .clock_speed_hz=26*1000*1000,           //Clock out at 26 MHz
 #else
-        .clock_speed_hz=10*1000*1000,           //Clock out at 10 MHz
+        devcfg.clock_speed_hz=10*1000*1000,           //Clock out at 10 MHz
 #endif
-        .mode=0,                                //SPI mode 0
-        .spics_io_num=PIN_NUM_CS,               //CS pin
-        .queue_size=7,                          //We want to be able to queue 7 transactions at a time
-        .pre_cb=lcd_spi_pre_transfer_callback,  //Specify pre-transfer callback to handle D/C line
-    };
-    //Initialize the SPI bus
-    ret=spi_bus_initialize(HSPI_HOST, &buscfg, 1);
-    ESP_ERROR_CHECK(ret);
-    //Attach the LCD to the SPI bus
-    ret=spi_bus_add_device(HSPI_HOST, &devcfg, &spi);
-    ESP_ERROR_CHECK(ret);
-    //Initialize the LCD
-    lcd_init(spi);
+        devcfg.mode=0,                                //SPI mode 0
+        devcfg.spics_io_num=PIN_NUM_CS,               //CS pin
+        devcfg.queue_size=7,                          //We want to be able to queue 7 transactions at a time
+        devcfg.pre_cb=lcd_spi_pre_transfer_callback,  //Specify pre-transfer callback to handle D/C line
+
+	//Initialize the SPI bus
+	ret=spi_bus_initialize(HSPI_HOST, &buscfg, 1);
+	ESP_ERROR_CHECK(ret);
+	//Attach the LCD to the SPI bus
+	ret=spi_bus_add_device(HSPI_HOST, &devcfg, &spi);
+	ESP_ERROR_CHECK(ret);
+	//Initialize the LCD
+	lcd_init(spi);
+
+	 //Policy,
+	 ESP32SPIWiring espSPI = ESP32SPIWiring::create(VSPI_HOST,LED_PIN_NONE,LED_PIN_MOSI,LED_PIN_CLK,LED_PIN_NONE, 1024);
+	 espSPI.init();
+	 //APA102c apa102c(&espSPI);
+	 //LED Type, #LEDs, isDoubleBuffered, default color
+	 //LEDs leds = LEDFactory::create(apa102c,100,false, RGB::WHITE);
     //Initialize the effect displayed
     ret=pretty_effect_init();
     ESP_ERROR_CHECK(ret);
