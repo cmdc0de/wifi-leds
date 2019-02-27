@@ -17,6 +17,7 @@
 #include "driver/gpio.h"
 
 #include "pretty_effect.h"
+#include <libesp/system.h>
 
 /*
  This code displays some fancy graphics on the 320x240 LCD on an ESP-WROVER_KIT board.
@@ -78,7 +79,7 @@ DRAM_ATTR static const lcd_init_cmd_t st_init_cmds[]={
     {0xB7, {0x45}, 1},
     /* VCOM Setting, VCOM=1.175V */
     {0xBB, {0x2B}, 1},
-    /* LCM Control, XOR: BGR, MX, MH */
+    /* LCM Control, XOR: RGB, MX, MH */
     {0xC0, {0x2C}, 1},
     /* VDV and VRH Command Enable, enable=1 */
     {0xC2, {0x01, 0xff}, 2},
@@ -130,7 +131,7 @@ DRAM_ATTR static const lcd_init_cmd_t ili_init_cmds[]={
     {0xC5, {0x35, 0x3E}, 2},
     /* VCOM control 2, VCOMH=VMH-2, VCOML=VML-2 */
     {0xC7, {0xBE}, 1},
-    /* Memory access contorl, MX=MY=0, MV=1, ML=0, BGR=1, MH=0 */
+    /* Memory access contorl, MX=MY=0, MV=1, ML=0, RGB=1, MH=0 */
     {0x36, {0x28}, 1},
     /* Pixel format, 16bits/pixel for RGB/MCU interface */
     {0x3A, {0x55}, 1},
@@ -384,14 +385,29 @@ static void display_pretty_colors(spi_device_handle_t spi)
 
 //////////////////////////////////////////////
 // LEDS
+
+class ErrorType {
+public:
+	ErrorType(esp_err_t et) : ErrType(et) {}
+	bool ok() {return ErrType==ESP_OK;}
+	const char *toString() {return esp_err_to_name(ErrType);}
+private:
+	esp_err_t ErrType;
+};
+
 class Wiring {
 public:
 	Wiring(){}
 	bool init() {
 		return onInit();
 	}
-	virtual uint8_t send(uint8_t b)=0;
-	virtual uint8_t receive(uint8_t b)=0;
+	ErrorType shutdown() {
+		return onShutdown();
+	}
+	virtual ErrorType sendAndReceive(uint8_t out, uint8_t &in)=0;
+	virtual ErrorType send(uint8_t *p, uint16_t len) =0;
+	virtual ErrorType onShutdown()=0;
+	virtual ~Wiring() {}
 protected:
 	virtual bool onInit()=0;
 };
@@ -403,11 +419,34 @@ public:
 		return esp32;
 	}
 public:
-	virtual uint8_t send(uint8_t b) {
-		return 0;
+	virtual ErrorType sendAndReceive(uint8_t out, uint8_t &in) {
+    		spi_transaction_t t;
+    		//if (len==0) return;       //no need to send anything
+    		memset(&t, 0, sizeof(t));   //Zero out the transaction
+    		t.length=8;                 //Len is in bytes, transaction length is in bits.
+		t.tx_data[0]=out;             //Data
+		t.flags = SPI_TRANS_USE_RXDATA | SPI_TRANS_USE_TXDATA;
+		t.user=(void*)1;              
+    		esp_err_t r = spi_device_transmit(spi, &t);  //Transmit!
+		in = t.rx_data[0];
+		return r;
 	}
-	virtual uint8_t receive(uint8_t b) {
-		return 0;
+	virtual ErrorType send(uint8_t *p, uint16_t len) {
+    		if (len==0) return ESP_OK;       //no need to send anything
+    		spi_transaction_t t;
+    		memset(&t, 0, sizeof(t));   //Zero out the transaction
+    		t.length=len*8;                 //Len is in bytes, transaction length is in bits.
+		t.tx_buffer=p;             //Data
+		t.user=(void*)2;              
+    		esp_err_t r = spi_device_transmit(spi, &t);  //Transmit!
+		return r;
+	}
+	virtual ~ESP32SPIWiring() {
+		shutdown();
+	}
+public:
+	ErrorType onShutdown() {
+		return spi_bus_free(SpiHD);
 	}
 protected:
 	ESP32SPIWiring(spi_host_device_t spihd, int miso, int mosi, int clk, int cs, int bufSize) 
@@ -457,8 +496,80 @@ private:
 	spi_device_handle_t spi;
 };
 
+class RGB {
+public:
+	static const RGB WHITE;
+	static const RGB BLUE;
+	static const RGB GREEN;
+public:
+	RGB() : B(0), G(0), R(0) {}
+	RGB(uint8_t r, uint8_t g, uint8_t b) : B(b), G(g), R(r) {}
+	RGB(const RGB &r) : B(r.B), G(r.G), R(r.R) {}
+	uint8_t getBlue()  {return B;}
+	uint8_t getRed()   {return R;}
+	uint8_t getGreen() {return G;}
+private:
+	uint8_t B,G,R;
+} __attribute__((packed));;
+
+const RGB RGB::WHITE(255,255,255);
+const RGB RGB::BLUE(0,0,255);
+const RGB RGB::GREEN(0,255,0);
+
+class APA102c {
+public:
+	enum BRIGHTNESS {
+		OFF = 0
+		, MIN_BRIGHTNESS = 1
+		, MID_BRIGHTNESS = 15
+		, MAX_BRIGHTNESS = 31
+	};
+public:
+	//0xE0 because high 3 bits are always on
+	APA102c(Wiring *spiI) : SPIInterface(spiI), Global(0xE0), BufferSize(0), LedBuffer1(0) {}
+	void setBrightness(uint8_t v) {
+		Global = 0xE0;
+		if(v>MAX_BRIGHTNESS) v = MAX_BRIGHTNESS;
+		Global|=v;
+	}
+	uint8_t getBrightness() {
+		return (Global&0x1F); //bottom 5 bits
+	}
+	void init(APA102c::BRIGHTNESS b, uint16_t nleds, RGB *ledBuf) {
+		setBrightness(b);
+		delete [] LedBuffer1;
+		BufferSize = (nleds*4)+8;
+		LedBuffer1 = new char [BufferSize];
+		int bufOff = 0;
+		LedBuffer1[bufOff]   = 0x0;
+		LedBuffer1[++bufOff] = 0x0;
+		LedBuffer1[++bufOff] = 0x0;
+		LedBuffer1[++bufOff] = 0x0;
+		for(int l=0;l<nleds;++l) {
+			LedBuffer1[++bufOff] = Global;
+			LedBuffer1[++bufOff] = ledBuf[l].getBlue();
+			LedBuffer1[++bufOff] = ledBuf[l].getGreen();
+			LedBuffer1[++bufOff] = ledBuf[l].getRed();
+		}
+		LedBuffer1[++bufOff] = 0xFF;
+		LedBuffer1[++bufOff] = 0xFF;
+		LedBuffer1[++bufOff] = 0xFF;
+		LedBuffer1[++bufOff] = 0xFF;
+	}
+	void send() {
+		printf("sending\n");
+		SPIInterface->send((uint8_t*)LedBuffer1,BufferSize);
+	}
+private:
+	Wiring *SPIInterface;
+	uint8_t Global;
+	uint16_t BufferSize;
+	char *LedBuffer1;
+};
+
 void app_main() {
 	esp_err_t ret;
+	/*
 	spi_device_handle_t spi;
 	spi_bus_config_t buscfg;
 	memset(&buscfg,0,sizeof(buscfg));
@@ -489,17 +600,35 @@ void app_main() {
 	ESP_ERROR_CHECK(ret);
 	//Initialize the LCD
 	lcd_init(spi);
+	*/
+	//Policy,
+	const int NUM_LEDS = 100;
+	ESP32SPIWiring espSPI = ESP32SPIWiring::create(VSPI_HOST,LED_PIN_NONE,LED_PIN_MOSI,LED_PIN_CLK,LED_PIN_NONE, 512);
+	espSPI.init();
+	APA102c apa102c(&espSPI);
+	RGB ledBuf[NUM_LEDS] = {RGB::BLUE};
+	for(int i=0;i<NUM_LEDS;i++) {
+		ledBuf[i] = RGB::BLUE;
+	}
+	apa102c.init(APA102c::MAX_BRIGHTNESS, NUM_LEDS,&ledBuf[0]);
+	apa102c.send();
+	vTaskDelay(5000 / portTICK_PERIOD_MS);
+	for(int i=0;i<NUM_LEDS;i++) {
+		ledBuf[i] = RGB::GREEN;
+	}
+	apa102c.init(APA102c::MIN_BRIGHTNESS, NUM_LEDS,&ledBuf[0]);
+	apa102c.send();
+	vTaskDelay(2000 / portTICK_PERIOD_MS);
+	for(int kk=0;kk<31;kk++) {
+		apa102c.init((APA102c::BRIGHTNESS)kk, NUM_LEDS,&ledBuf[0]);
+		apa102c.send();
+		vTaskDelay(500 / portTICK_PERIOD_MS);
+	}
+	
+	//Initialize the effect displayed
+	//ret=pretty_effect_init();
+	//ESP_ERROR_CHECK(ret);
 
-	 //Policy,
-	 ESP32SPIWiring espSPI = ESP32SPIWiring::create(VSPI_HOST,LED_PIN_NONE,LED_PIN_MOSI,LED_PIN_CLK,LED_PIN_NONE, 1024);
-	 espSPI.init();
-	 //APA102c apa102c(&espSPI);
-	 //LED Type, #LEDs, isDoubleBuffered, default color
-	 //LEDs leds = LEDFactory::create(apa102c,100,false, RGB::WHITE);
-    //Initialize the effect displayed
-    ret=pretty_effect_init();
-    ESP_ERROR_CHECK(ret);
-
-    //Go do nice stuff.
-    display_pretty_colors(spi);
+	//Go do nice stuff.
+	//display_pretty_colors(spi);
 }

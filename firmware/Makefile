@@ -3,7 +3,11 @@
 # project subdirectory.
 #
 
-PROJECT_NAME := spi_master
+PROJECT_NAME := wifi-leds
 
 include $(IDF_PATH)/make/project.mk
+
+#size:
+#	xtensa-esp32-elf-size build/dc26esp.elf
+
 
