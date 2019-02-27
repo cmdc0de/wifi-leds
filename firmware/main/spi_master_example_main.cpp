@@ -18,6 +18,7 @@
 
 #include "pretty_effect.h"
 #include <libesp/system.h>
+#include <esp_log.h>
 
 /*
  This code displays some fancy graphics on the 320x240 LCD on an ESP-WROVER_KIT board.
@@ -414,16 +415,15 @@ protected:
 
 class ESP32SPIWiring : public Wiring {
 public:
-	static ESP32SPIWiring create(spi_host_device_t shd, int miso, int mosi, int clk, int cs, int tb) {
-		ESP32SPIWiring esp32(shd,miso,mosi,clk,cs, tb);
+	static ESP32SPIWiring create(spi_host_device_t shd, int miso, int mosi, int clk, int cs, int tb, int dma) {
+		ESP32SPIWiring esp32(shd,miso,mosi,clk,cs, tb,dma);
 		return esp32;
 	}
 public:
 	virtual ErrorType sendAndReceive(uint8_t out, uint8_t &in) {
-    		spi_transaction_t t;
-    		//if (len==0) return;       //no need to send anything
-    		memset(&t, 0, sizeof(t));   //Zero out the transaction
-    		t.length=8;                 //Len is in bytes, transaction length is in bits.
+    	spi_transaction_t t;
+    	memset(&t, 0, sizeof(t));   //Zero out the transaction
+    	t.length=8;                 //Len is in bytes, transaction length is in bits.
 		t.tx_data[0]=out;             //Data
 		t.flags = SPI_TRANS_USE_RXDATA | SPI_TRANS_USE_TXDATA;
 		t.user=(void*)1;              
@@ -449,8 +449,9 @@ public:
 		return spi_bus_free(SpiHD);
 	}
 protected:
-	ESP32SPIWiring(spi_host_device_t spihd, int miso, int mosi, int clk, int cs, int bufSize) 
-		: SpiHD(spihd), PinMiso(miso), PinMosi(mosi), PinCLK(clk), PinCS(cs), TransferBufferSize(bufSize) { }
+	ESP32SPIWiring(spi_host_device_t spihd, int miso, int mosi, int clk, int cs, int bufSize, int dmachannel) 
+		: SpiHD(spihd), PinMiso(miso), PinMosi(mosi), PinCLK(clk), PinCS(cs), TransferBufferSize(bufSize), 
+		DMAChannel(dmachannel) { }
 	virtual bool onInit() {
 		esp_err_t ret;
 
@@ -465,7 +466,7 @@ protected:
 		buscfg.intr_flags = 0;
 
 		//Initialize the SPI bus
-		ret=spi_bus_initialize(SpiHD, &buscfg, 1);
+		ret=spi_bus_initialize(SpiHD, &buscfg, DMAChannel);
 		ESP_ERROR_CHECK(ret);
 
 		spi_device_interface_config_t devcfg;
@@ -493,50 +494,53 @@ private:
 	int PinCLK;
 	int PinCS;
 	int TransferBufferSize;
+	int DMAChannel;
 	spi_device_handle_t spi;
 };
 
+/*
+	Brightness is a percentage
+*/
 class RGB {
 public:
 	static const RGB WHITE;
 	static const RGB BLUE;
 	static const RGB GREEN;
+	static const RGB RED;
 public:
-	RGB() : B(0), G(0), R(0) {}
-	RGB(uint8_t r, uint8_t g, uint8_t b) : B(b), G(g), R(r) {}
-	RGB(const RGB &r) : B(r.B), G(r.G), R(r.R) {}
+	RGB() : B(0), G(0), R(0), Brightness(100) {}
+	RGB(uint8_t r, uint8_t g, uint8_t b, uint8_t brightness) : B(b), G(g), R(r), Brightness(brightness) {}
+	RGB(const RGB &r) : B(r.B), G(r.G), R(r.R), Brightness(r.Brightness) {}
 	uint8_t getBlue()  {return B;}
 	uint8_t getRed()   {return R;}
 	uint8_t getGreen() {return G;}
+	uint8_t getBrightness() {return Brightness;}
+	void setBlue(uint8_t v) 	{B=v;}
+	void setRed(uint8_t v)  	{R=v;}
+	void setGreen(uint8_t v) 	{G=v;}
+	void setBrightness(uint8_t v)	{Brightness=((v>100)?100:v);}
 private:
-	uint8_t B,G,R;
+	uint8_t B;
+	uint8_t G;
+	uint8_t R;
+	uint8_t Brightness;
 } __attribute__((packed));;
 
-const RGB RGB::WHITE(255,255,255);
-const RGB RGB::BLUE(0,0,255);
-const RGB RGB::GREEN(0,255,0);
+const RGB RGB::WHITE(255,255,255,100);
+const RGB RGB::BLUE(0,0,255,100);
+const RGB RGB::GREEN(0,255,0,100);
+const RGB RGB::RED(255,0,0,100);
 
 class APA102c {
 public:
-	enum BRIGHTNESS {
-		OFF = 0
-		, MIN_BRIGHTNESS = 1
-		, MID_BRIGHTNESS = 15
-		, MAX_BRIGHTNESS = 31
-	};
-public:
 	//0xE0 because high 3 bits are always on
-	APA102c(Wiring *spiI) : SPIInterface(spiI), Global(0xE0), BufferSize(0), LedBuffer1(0) {}
-	void setBrightness(uint8_t v) {
-		Global = 0xE0;
-		if(v>MAX_BRIGHTNESS) v = MAX_BRIGHTNESS;
-		Global|=v;
-	}
-	uint8_t getBrightness() {
-		return (Global&0x1F); //bottom 5 bits
-	}
-	void init(APA102c::BRIGHTNESS b, uint16_t nleds, RGB *ledBuf) {
-		setBrightness(b);
+	static const uint8_t BRIGHTNESS_START_BITS = 0xE0;
+	static const uint8_t MAX_BRIGHTNESS			 = 31;
+	static const char *LOG;
+public:
+	APA102c(Wiring *spiI) : SPIInterface(spiI), BufferSize(0), LedBuffer1(0) {}
+	
+	void init(uint16_t nleds, RGB *ledBuf) {
 		delete [] LedBuffer1;
 		BufferSize = (nleds*4)+8;
 		LedBuffer1 = new char [BufferSize];
@@ -546,7 +550,9 @@ public:
 		LedBuffer1[++bufOff] = 0x0;
 		LedBuffer1[++bufOff] = 0x0;
 		for(int l=0;l<nleds;++l) {
-			LedBuffer1[++bufOff] = Global;
+			uint8_t bright = ledBuf[l].getBrightness();
+			bright = (uint8_t)(((float)bright/100.0f)*MAX_BRIGHTNESS);
+			LedBuffer1[++bufOff] = BRIGHTNESS_START_BITS|bright;
 			LedBuffer1[++bufOff] = ledBuf[l].getBlue();
 			LedBuffer1[++bufOff] = ledBuf[l].getGreen();
 			LedBuffer1[++bufOff] = ledBuf[l].getRed();
@@ -557,19 +563,24 @@ public:
 		LedBuffer1[++bufOff] = 0xFF;
 	}
 	void send() {
-		printf("sending\n");
-		SPIInterface->send((uint8_t*)LedBuffer1,BufferSize);
+		if(BufferSize>0) {
+			ESP_LOGI(APA102c::LOG,"sending %d leds r[0]:%d, g[0]:%d, b[0]:%d, B[0]:%d\n", (BufferSize/4)-8,
+				LedBuffer1[3], LedBuffer1[2], LedBuffer1[1], LedBuffer1[0]);
+			ESP_LOG_BUFFER_HEX(APA102c::LOG, LedBuffer1, BufferSize);
+			SPIInterface->send((uint8_t*)LedBuffer1,BufferSize);
+		}
 	}
 private:
 	Wiring *SPIInterface;
-	uint8_t Global;
 	uint16_t BufferSize;
 	char *LedBuffer1;
 };
 
+const char *APA102c::LOG = "APA102c";
+
 void app_main() {
 	esp_err_t ret;
-	/*
+	
 	spi_device_handle_t spi;
 	spi_bus_config_t buscfg;
 	memset(&buscfg,0,sizeof(buscfg));
@@ -580,7 +591,7 @@ void app_main() {
         buscfg.quadhd_io_num=-1;
 	buscfg.max_transfer_sz=PARALLEL_LINES*320*2+8;
 
-    	spi_device_interface_config_t devcfg;
+   spi_device_interface_config_t devcfg;
 	memset(&devcfg,0,sizeof(devcfg));
 #ifdef CONFIG_LCD_OVERCLOCK
         .clock_speed_hz=26*1000*1000,           //Clock out at 26 MHz
@@ -600,35 +611,39 @@ void app_main() {
 	ESP_ERROR_CHECK(ret);
 	//Initialize the LCD
 	lcd_init(spi);
-	*/
+	
 	//Policy,
 	const int NUM_LEDS = 100;
-	ESP32SPIWiring espSPI = ESP32SPIWiring::create(VSPI_HOST,LED_PIN_NONE,LED_PIN_MOSI,LED_PIN_CLK,LED_PIN_NONE, 512);
+	ESP32SPIWiring espSPI = ESP32SPIWiring::create(VSPI_HOST,LED_PIN_NONE,LED_PIN_MOSI,
+																	LED_PIN_CLK,LED_PIN_NONE, 1024, 2);
 	espSPI.init();
 	APA102c apa102c(&espSPI);
 	RGB ledBuf[NUM_LEDS] = {RGB::BLUE};
 	for(int i=0;i<NUM_LEDS;i++) {
 		ledBuf[i] = RGB::BLUE;
 	}
-	apa102c.init(APA102c::MAX_BRIGHTNESS, NUM_LEDS,&ledBuf[0]);
+	apa102c.init(NUM_LEDS,&ledBuf[0]);
 	apa102c.send();
-	vTaskDelay(5000 / portTICK_PERIOD_MS);
+	vTaskDelay(2000 / portTICK_PERIOD_MS);
 	for(int i=0;i<NUM_LEDS;i++) {
 		ledBuf[i] = RGB::GREEN;
 	}
-	apa102c.init(APA102c::MIN_BRIGHTNESS, NUM_LEDS,&ledBuf[0]);
+	apa102c.init(NUM_LEDS,&ledBuf[0]);
 	apa102c.send();
 	vTaskDelay(2000 / portTICK_PERIOD_MS);
-	for(int kk=0;kk<31;kk++) {
-		apa102c.init((APA102c::BRIGHTNESS)kk, NUM_LEDS,&ledBuf[0]);
+	for(int kk=0;kk<101;kk+=5) {
+		for(int i=0;i<NUM_LEDS;i++) {
+			ledBuf[i].setBrightness(kk);
+		}
+		apa102c.init(NUM_LEDS,&ledBuf[0]);
 		apa102c.send();
-		vTaskDelay(500 / portTICK_PERIOD_MS);
+		vTaskDelay(300 / portTICK_PERIOD_MS);
 	}
 	
 	//Initialize the effect displayed
-	//ret=pretty_effect_init();
-	//ESP_ERROR_CHECK(ret);
+	ret=pretty_effect_init();
+	ESP_ERROR_CHECK(ret);
 
 	//Go do nice stuff.
-	//display_pretty_colors(spi);
+	display_pretty_colors(spi);
 }
