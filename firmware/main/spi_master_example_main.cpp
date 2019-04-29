@@ -18,6 +18,7 @@
 
 #include "pretty_effect.h"
 #include <libesp/system.h>
+#include <libesp/i2c.hpp>
 #include <esp_log.h>
 
 /*
@@ -31,18 +32,18 @@
  before the transaction is sent, the callback will set this line to the correct state.
 */
 
-#define PIN_NUM_MISO 25
+#define PIN_NUM_MISO 19 //25
 #define PIN_NUM_MOSI 23
-#define PIN_NUM_CLK  19
-#define PIN_NUM_CS   22
+#define PIN_NUM_CLK  18 //19
+#define PIN_NUM_CS   17 //22
 
-#define PIN_NUM_DC   21
-#define PIN_NUM_RST  18
-#define PIN_NUM_BCKL 5
+#define PIN_NUM_DC   4 //21
+#define PIN_NUM_RST  -1 //18
+#define PIN_NUM_BCKL -1 //5
 
 
-#define LED_PIN_MOSI 13
-#define LED_PIN_CLK  14
+#define LED_PIN_MOSI 16 //13
+#define LED_PIN_CLK  2 //14
 #define LED_PIN_NONE -1
 //To speed up transfers, every SPI transfer sends a bunch of lines. This define specifies how many. More means more memory use,
 //but less overhead for setting up / finishing transfers. Make sure 240 is dividable by this.
@@ -223,14 +224,14 @@ void lcd_init(spi_device_handle_t spi)
 
     //Initialize non-SPI GPIOs
     gpio_set_direction((gpio_num_t)PIN_NUM_DC, GPIO_MODE_OUTPUT);
-    gpio_set_direction((gpio_num_t)PIN_NUM_RST, GPIO_MODE_OUTPUT);
-    gpio_set_direction((gpio_num_t)PIN_NUM_BCKL, GPIO_MODE_OUTPUT);
+    //gpio_set_direction((gpio_num_t)PIN_NUM_RST, GPIO_MODE_OUTPUT);
+    //gpio_set_direction((gpio_num_t)PIN_NUM_BCKL, GPIO_MODE_OUTPUT);
 
     //Reset the display
-    gpio_set_level((gpio_num_t)PIN_NUM_RST, 0);
-    vTaskDelay(100 / portTICK_RATE_MS);
-    gpio_set_level((gpio_num_t)PIN_NUM_RST, 1);
-    vTaskDelay(100 / portTICK_RATE_MS);
+    //gpio_set_level((gpio_num_t)PIN_NUM_RST, 0);
+    //vTaskDelay(100 / portTICK_RATE_MS);
+    //gpio_set_level((gpio_num_t)PIN_NUM_RST, 1);
+    //vTaskDelay(100 / portTICK_RATE_MS);
 
     //detect LCD type
     uint32_t lcd_id = lcd_get_id(spi);
@@ -276,7 +277,7 @@ void lcd_init(spi_device_handle_t spi)
     }
 
     ///Enable backlight
-    gpio_set_level((gpio_num_t)PIN_NUM_BCKL, 0);
+    //gpio_set_level((gpio_num_t)PIN_NUM_BCKL, 0);
 }
 
 
@@ -577,7 +578,28 @@ private:
 };
 
 const char *APA102c::LOG = "APA102c";
+#if 1
+void app_main() {
+	//ESP32_I2CMaster I2cDisplay(GPIO_NUM_19,GPIO_NUM_18,1000000, I2C_NUM_0, 0, 32);
+	//ESP32_I2CMaster::doIt();
+	ESP32_I2CMaster I2c(GPIO_NUM_22,GPIO_NUM_21,1000000, I2C_NUM_0, 0, 32);
+	I2c.init(false);
+	I2c.scan();
+	//ESP32_I2CMaster::doLED();
+/*
+	ESP_LOGI(APA102c::LOG,"led");
+	I2c.start(0x30,true);
+	ESP_LOGI(APA102c::LOG,"after start");
+	unsigned char buf[2] = {0x2,0xFF};
+	I2c.write(&buf[0],2,false);
+	ESP_LOGI(APA102c::LOG,"after write");
+	I2c.stop(1000000);
+*/
+	libesp::System::get().logSystemInfo();	
+}
 
+#else
+//#if 0
 void app_main() {
 	esp_err_t ret;
 	
@@ -613,7 +635,7 @@ void app_main() {
 	lcd_init(spi);
 	
 	//Policy,
-	const int NUM_LEDS = 100;
+	const int NUM_LEDS = 4;
 	ESP32SPIWiring espSPI = ESP32SPIWiring::create(VSPI_HOST,LED_PIN_NONE,LED_PIN_MOSI,
 																	LED_PIN_CLK,LED_PIN_NONE, 1024, 2);
 	espSPI.init();
@@ -647,3 +669,4 @@ void app_main() {
 	//Go do nice stuff.
 	display_pretty_colors(spi);
 }
+#endif
